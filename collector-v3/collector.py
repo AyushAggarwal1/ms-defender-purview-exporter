@@ -1,21 +1,23 @@
 #!/usr/bin/env python3
-"""Export Microsoft Defender XDR and Microsoft Purview data to JSON.
+"""Export Microsoft Defender XDR and Microsoft Purview activity data to JSON.
 
-Collected sources:
+Data sources:
 1. Microsoft Graph Security API
    - /security/incidents
    - /security/alerts_v2
-2. Microsoft Defender XDR Advanced Hunting
-   - Every table currently listed in the Microsoft Defender XDR hunting schema
-   - Microsoft Graph runHuntingQuery when ThreatHunting.Read.All is available
-   - Automatic fallback to the legacy Defender endpoint while it remains available
-3. Microsoft Purview Audit Search API
-   - /security/auditLog/queries and all returned audit record types
-4. Office 365 Management Activity API
-   - All five supported content types: Entra, Exchange, SharePoint, General, and DLP
+2. Microsoft Defender XDR Advanced Hunting API
+   - All 64 tables currently documented in the Defender XDR hunting schema
+   - Event tables are time-sliced; snapshot tables are queried without Timestamp filters
+3. Office 365 Management Activity API (Microsoft Purview audit/DLP feed)
+   - Audit.AzureActiveDirectory
+   - Audit.Exchange
+   - Audit.SharePoint
+   - Audit.General
+   - DLP.All
 
-The exporter preserves raw API fields. It also builds a correlated email index keyed
-by NetworkMessageId when the relevant email tables are available.
+The exporter preserves raw API fields and also builds a correlated email index keyed
+by NetworkMessageId, which makes subjects, attachment names, URLs, recipients, and
+post-delivery actions easier to consume.
 """
 
 from __future__ import annotations
@@ -26,7 +28,6 @@ import json
 import logging
 import os
 import random
-import re
 import sys
 import time
 from dataclasses import dataclass
@@ -44,14 +45,11 @@ DEFENDER_SCOPE = "https://api.security.microsoft.com/.default"
 PURVIEW_SCOPE = "https://manage.office.com/.default"
 
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
-GRAPH_HUNTING_URL = f"{GRAPH_BASE}/security/runHuntingQuery"
-LEGACY_DEFENDER_HUNTING_URL = "https://api.security.microsoft.com/api/advancedhunting/run"
+DEFENDER_HUNTING_URL = "https://api.security.microsoft.com/api/advancedhunting/run"
 PURVIEW_MANAGE_BASE = "https://manage.office.com/api/v1.0"
 
-# All tables listed in Microsoft's Defender XDR advanced hunting schema as of
-# 2026-04-13. Preview tables are intentionally included. A tenant can return an
-# authorization/availability error for tables whose product, preview, integration,
-# or RBAC requirement isn't enabled; those errors are recorded per table.
+# Microsoft Defender XDR Advanced Hunting schema tables documented by Microsoft
+# as of 2026-04-13. Availability still depends on tenant licensing and enabled products.
 ALL_HUNTING_TABLES = (
     "AADSignInEventsBeta",
     "AADSpnSignInEventsBeta",
@@ -118,20 +116,18 @@ ALL_HUNTING_TABLES = (
     "OAuthAppInfo",
     "UrlClickEvents",
 )
-DEFAULT_HUNTING_TABLES = ALL_HUNTING_TABLES
 
-# The Management Activity API exposes exactly these five content types.
-# Audit.General includes all workloads not represented by the first three audit feeds.
-ALL_PURVIEW_CONTENT_TYPES = (
+DEFAULT_HUNTING_TABLES = ALL_HUNTING_TABLES
+HUNTING_MAX_ROWS_PER_QUERY = 100_000
+HUNTING_MIN_SLICE = timedelta(minutes=1)
+
+DEFAULT_PURVIEW_CONTENT_TYPES = (
     "Audit.AzureActiveDirectory",
     "Audit.Exchange",
     "Audit.SharePoint",
     "Audit.General",
     "DLP.All",
 )
-DEFAULT_PURVIEW_CONTENT_TYPES = ALL_PURVIEW_CONTENT_TYPES
-
-ADVANCED_HUNTING_MAX_ROWS = 100_000
 
 RETRYABLE_STATUS_CODES = {408, 429, 500, 502, 503, 504}
 
@@ -448,301 +444,181 @@ class GraphSecurityCollector:
 
 
 class AdvancedHuntingCollector:
-    """Export every requested Defender XDR hunting table.
-
-    The collector probes each table's schema. Tables with a Timestamp column are
-    collected in time slices, with recursive splitting when a slice reaches the API
-    row ceiling. Tables without Timestamp are collected as current entity/snapshot
-    data with an explicit row ceiling and a truncation warning when that ceiling is hit.
-
-    Microsoft Graph runHuntingQuery is preferred. In auto mode, the collector falls
-    back once to the legacy Defender endpoint if the Graph permission isn't present.
-    """
-
-    def __init__(
-        self,
-        graph_client: ApiClient,
-        legacy_client: ApiClient,
-        chunk_hours: int,
-        *,
-        min_chunk_minutes: int = 5,
-        max_rows: int = ADVANCED_HUNTING_MAX_ROWS,
-        backend: str = "auto",
-    ) -> None:
-        if chunk_hours <= 0:
-            raise CollectorError("--hunting-chunk-hours must be greater than zero")
-        if min_chunk_minutes <= 0:
-            raise CollectorError("--hunting-min-chunk-minutes must be greater than zero")
-        if max_rows <= 0 or max_rows > ADVANCED_HUNTING_MAX_ROWS:
-            raise CollectorError(
-                f"--hunting-max-rows must be between 1 and {ADVANCED_HUNTING_MAX_ROWS}"
-            )
-        if backend not in {"auto", "graph", "legacy"}:
-            raise CollectorError("--hunting-api must be auto, graph, or legacy")
-
-        self.graph_client = graph_client
-        self.legacy_client = legacy_client
+    def __init__(self, client: ApiClient, chunk_hours: int) -> None:
+        self.client = client
         self.chunk_size = timedelta(hours=chunk_hours)
-        self.min_chunk_size = timedelta(minutes=min_chunk_minutes)
-        self.max_rows = max_rows
-        self.requested_backend = backend
-        self.selected_backend: Optional[str] = None if backend == "auto" else backend
-        self.backend_probe_error: Optional[str] = None
 
-    @staticmethod
-    def _validate_table(table: str) -> str:
-        if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*", table):
-            raise CollectorError(f"Invalid Advanced Hunting table identifier: {table!r}")
-        return table
-
-    @staticmethod
-    def _normalize_response(payload: Any) -> Dict[str, Any]:
-        if not isinstance(payload, dict):
-            raise CollectorError("Unexpected Advanced Hunting response")
-        rows = payload.get("results", payload.get("Results", []))
-        schema = payload.get("schema", payload.get("Schema", []))
-        stats = payload.get("stats", payload.get("Stats", {}))
-        return {
-            "results": rows if isinstance(rows, list) else [],
-            "schema": schema if isinstance(schema, list) else [],
-            "stats": stats,
-            "raw": payload,
-        }
-
-    def _run_graph(self, query: str, start: Optional[datetime], end: Optional[datetime]) -> Dict[str, Any]:
-        body: Dict[str, Any] = {"Query": query}
-        if start is not None and end is not None:
-            body["Timespan"] = f"{iso_z(start)}/{iso_z(end)}"
-        payload, _ = self.graph_client.post_json(
-            GRAPH_HUNTING_URL,
-            json_body=body,
-            expected=(200,),
-        )
-        return self._normalize_response(payload)
-
-    def _run_legacy(self, query: str) -> Dict[str, Any]:
-        payload, _ = self.legacy_client.post_json(
-            LEGACY_DEFENDER_HUNTING_URL,
+    def run_query(self, query: str) -> Dict[str, Any]:
+        payload, _ = self.client.post_json(
+            DEFENDER_HUNTING_URL,
             json_body={"Query": query},
             expected=(200,),
         )
-        return self._normalize_response(payload)
-
-    def run_query(
-        self,
-        query: str,
-        *,
-        start: Optional[datetime] = None,
-        end: Optional[datetime] = None,
-    ) -> Dict[str, Any]:
-        if self.selected_backend == "graph":
-            return self._run_graph(query, start, end)
-        if self.selected_backend == "legacy":
-            return self._run_legacy(query)
-
-        # Auto mode: Graph is the current API. Fall back to the legacy endpoint so
-        # existing apps with AdvancedHunting.Read.All continue to work until migration.
-        try:
-            response = self._run_graph(query, start, end)
-            self.selected_backend = "graph"
-            logging.info("Using Microsoft Graph runHuntingQuery for Advanced Hunting")
-            return response
-        except Exception as graph_exc:
-            self.backend_probe_error = str(graph_exc)
-            logging.warning(
-                "Microsoft Graph Advanced Hunting failed; trying the legacy Defender endpoint: %s",
-                graph_exc,
-            )
-            try:
-                response = self._run_legacy(query)
-                self.selected_backend = "legacy"
-                logging.info("Using legacy Defender Advanced Hunting endpoint")
-                return response
-            except Exception as legacy_exc:
-                raise CollectorError(
-                    "Both Advanced Hunting APIs failed. Graph error: "
-                    f"{graph_exc}; legacy error: {legacy_exc}"
-                ) from legacy_exc
+        if not isinstance(payload, dict):
+            raise CollectorError("Unexpected Advanced Hunting response")
+        return payload
 
     @staticmethod
-    def _schema_column_names(schema: Sequence[Any]) -> List[str]:
-        names: List[str] = []
+    def _schema_column_names(schema: Any) -> set[str]:
+        names: set[str] = set()
+        if not isinstance(schema, list):
+            return names
         for column in schema:
             if not isinstance(column, dict):
                 continue
-            name = column.get("name", column.get("Name"))
+            name = column.get("Name") or column.get("name") or column.get("ColumnName")
             if name:
-                names.append(str(name))
+                names.add(str(name))
         return names
 
-    def probe_table_schema(self, table: str) -> Dict[str, Any]:
+    def _inspect_table(self, table: str) -> Tuple[List[Any], bool]:
+        # A zero-row query returns the table schema without exporting data. This lets
+        # us distinguish event tables from inventory/snapshot tables that do not have
+        # a Timestamp column.
         response = self.run_query(f"{table}\n| take 0")
-        schema = response.get("schema", [])
-        column_names = self._schema_column_names(schema)
-        return {
-            "schema": schema,
-            "column_names": column_names,
-            "has_timestamp": any(name.casefold() == "timestamp" for name in column_names),
-        }
+        schema = response.get("Schema", [])
+        return schema if isinstance(schema, list) else [], "Timestamp" in self._schema_column_names(schema)
 
-    def _query_time_slice(
+    def _collect_timestamp_slice(
         self,
         table: str,
         start: datetime,
         end: datetime,
-    ) -> Dict[str, Any]:
+        depth: int = 0,
+    ) -> Tuple[List[Dict[str, Any]], List[Any], List[Any], List[Dict[str, Any]], bool]:
         query = (
             f"{table}\n"
             f"| where Timestamp >= datetime({kusto_datetime(start)}) "
-            f"and Timestamp < datetime({kusto_datetime(end)})\n"
-            f"| take {self.max_rows}"
+            f"and Timestamp < datetime({kusto_datetime(end)})"
         )
-        return self.run_query(query, start=start, end=end)
-
-    def _collect_time_slice_recursive(
-        self,
-        table: str,
-        start: datetime,
-        end: datetime,
-        rows: List[Dict[str, Any]],
-        query_stats: List[Any],
-        slices: List[Dict[str, Any]],
-        errors: List[Dict[str, Any]],
-    ) -> None:
-        try:
-            response = self._query_time_slice(table, start, end)
-        except Exception as exc:
-            logging.exception(
-                "Advanced Hunting table %s failed for %s to %s",
-                table,
-                iso_z(start),
-                iso_z(end),
-            )
-            errors.append(
-                {
-                    "stage": "time_slice",
-                    "start": iso_z(start),
-                    "end": iso_z(end),
-                    "error": str(exc),
-                }
-            )
-            return
-
-        result_rows = [row for row in response.get("results", []) if isinstance(row, dict)]
-        hit_limit = len(result_rows) >= self.max_rows
+        response = self.run_query(query)
+        raw_rows = response.get("Results", [])
+        rows = [row for row in raw_rows if isinstance(row, dict)] if isinstance(raw_rows, list) else []
+        schema = response.get("Schema", [])
+        stats = response.get("Stats")
+        hit_limit = len(rows) >= HUNTING_MAX_ROWS_PER_QUERY
         duration = end - start
 
-        if hit_limit and duration > self.min_chunk_size:
-            midpoint = start + (duration / 2)
-            logging.warning(
-                "%s returned %d rows for %s to %s; splitting the interval",
-                table,
-                len(result_rows),
-                iso_z(start),
-                iso_z(end),
+        # Advanced Hunting has a 100,000-row result ceiling. Split busy time windows
+        # recursively to reduce data loss. There is no generic cursor for this API.
+        if hit_limit and duration > HUNTING_MIN_SLICE:
+            midpoint = start + duration / 2
+            left = self._collect_timestamp_slice(table, start, midpoint, depth + 1)
+            right = self._collect_timestamp_slice(table, midpoint, end, depth + 1)
+            return (
+                left[0] + right[0],
+                left[1] or right[1],
+                left[2] + right[2],
+                left[3] + right[3],
+                left[4] or right[4],
             )
-            self._collect_time_slice_recursive(
-                table, start, midpoint, rows, query_stats, slices, errors
-            )
-            self._collect_time_slice_recursive(
-                table, midpoint, end, rows, query_stats, slices, errors
-            )
-            return
 
-        rows.extend(result_rows)
-        if response.get("stats") is not None:
-            query_stats.append(response.get("stats"))
-        slices.append(
-            {
-                "start": iso_z(start),
-                "end": iso_z(end),
-                "rows": len(result_rows),
-                "hitRowLimit": hit_limit,
-                "minimumSliceReached": bool(hit_limit and duration <= self.min_chunk_size),
-            }
+        slice_info = {
+            "start": iso_z(start),
+            "end": iso_z(end),
+            "rows": len(rows),
+            "hitRowLimit": hit_limit,
+            "minimumSliceReached": bool(hit_limit and duration <= HUNTING_MIN_SLICE),
+            "splitDepth": depth,
+        }
+        return (
+            rows,
+            schema if isinstance(schema, list) else [],
+            [stats] if stats is not None else [],
+            [slice_info],
+            bool(hit_limit and duration <= HUNTING_MIN_SLICE),
         )
 
     def collect_table(self, table: str, start: datetime, end: datetime) -> Dict[str, Any]:
-        table = self._validate_table(table)
-        output: Dict[str, Any] = {
-            "results": [],
-            "schema": [],
-            "query_stats": [],
-            "slices": [],
-            "errors": [],
-            "collection_mode": "unknown",
-            "possible_truncation": False,
-            "max_rows_per_query": self.max_rows,
-        }
-
         try:
-            schema_info = self.probe_table_schema(table)
-            output["schema"] = schema_info["schema"]
-            output["schema_columns"] = schema_info["column_names"]
+            probe_schema, has_timestamp = self._inspect_table(table)
         except Exception as exc:
-            logging.exception("Advanced Hunting schema probe failed for %s", table)
-            output["errors"].append({"stage": "schema_probe", "error": str(exc)})
-            output["backend"] = self.selected_backend or self.requested_backend
-            return output
+            logging.exception("Advanced Hunting table %s schema probe failed", table)
+            return {
+                "collection_mode": "unavailable",
+                "results": [],
+                "schema": [],
+                "query_stats": [],
+                "slices": [],
+                "possible_truncation": False,
+                "errors": [{"error": str(exc)}],
+            }
 
-        if schema_info["has_timestamp"]:
-            output["collection_mode"] = "time_sliced"
-            rows: List[Dict[str, Any]] = []
-            stats: List[Any] = []
-            slices_meta: List[Dict[str, Any]] = []
-            errors: List[Dict[str, Any]] = []
-            for chunk_start, chunk_end in chunks(start, end, self.chunk_size):
-                self._collect_time_slice_recursive(
-                    table,
-                    chunk_start,
-                    chunk_end,
-                    rows,
-                    stats,
-                    slices_meta,
-                    errors,
-                )
-            output["results"] = unique_records(rows)
-            output["query_stats"] = stats
-            output["slices"] = slices_meta
-            output["errors"] = errors
-            output["possible_truncation"] = any(
-                item.get("minimumSliceReached") for item in slices_meta
-            )
-        else:
-            output["collection_mode"] = "snapshot_or_entity"
-            query = f"{table}\n| take {self.max_rows}"
+        if not has_timestamp:
             try:
-                response = self.run_query(query)
-                rows = [row for row in response.get("results", []) if isinstance(row, dict)]
-                output["results"] = unique_records(rows)
-                output["query_stats"] = [response.get("stats")]
-                output["slices"] = [
-                    {
-                        "rows": len(rows),
-                        "hitRowLimit": len(rows) >= self.max_rows,
-                        "note": "Table has no Timestamp column; a current snapshot/entity export was used.",
-                    }
-                ]
-                output["possible_truncation"] = len(rows) >= self.max_rows
+                response = self.run_query(f"{table}\n| take {HUNTING_MAX_ROWS_PER_QUERY}")
+                raw_rows = response.get("Results", [])
+                rows = [row for row in raw_rows if isinstance(row, dict)] if isinstance(raw_rows, list) else []
+                schema = response.get("Schema", probe_schema)
+                possible_truncation = len(rows) >= HUNTING_MAX_ROWS_PER_QUERY
+                return {
+                    "collection_mode": "snapshot",
+                    "results": rows,
+                    "schema": schema if isinstance(schema, list) else probe_schema,
+                    "query_stats": [response.get("Stats")] if response.get("Stats") is not None else [],
+                    "slices": [],
+                    "possible_truncation": possible_truncation,
+                    "errors": [],
+                    "note": (
+                        "This table has no Timestamp column and was queried as a current snapshot. "
+                        "Snapshot tables cannot be generically paginated through Advanced Hunting."
+                    ),
+                }
             except Exception as exc:
                 logging.exception("Advanced Hunting snapshot table %s failed", table)
-                output["errors"].append({"stage": "snapshot_query", "error": str(exc)})
+                return {
+                    "collection_mode": "snapshot",
+                    "results": [],
+                    "schema": probe_schema,
+                    "query_stats": [],
+                    "slices": [],
+                    "possible_truncation": False,
+                    "errors": [{"error": str(exc)}],
+                }
 
-        output["backend"] = self.selected_backend or self.requested_backend
-        output["count"] = len(output.get("results", []))
-        return output
+        all_results: List[Dict[str, Any]] = []
+        schema: List[Any] = probe_schema
+        stats: List[Any] = []
+        slices: List[Dict[str, Any]] = []
+        errors: List[Dict[str, Any]] = []
+        possible_truncation = False
+
+        for chunk_start, chunk_end in chunks(start, end, self.chunk_size):
+            try:
+                rows, chunk_schema, chunk_stats, chunk_slices, chunk_truncated = (
+                    self._collect_timestamp_slice(table, chunk_start, chunk_end)
+                )
+                all_results.extend(rows)
+                if chunk_schema:
+                    schema = chunk_schema
+                stats.extend(chunk_stats)
+                slices.extend(chunk_slices)
+                possible_truncation = possible_truncation or chunk_truncated
+            except Exception as exc:
+                logging.exception("Advanced Hunting table %s failed", table)
+                errors.append({
+                    "start": iso_z(chunk_start),
+                    "end": iso_z(chunk_end),
+                    "error": str(exc),
+                })
+
+        return {
+            "collection_mode": "time_sliced",
+            "results": all_results,
+            "schema": schema,
+            "query_stats": stats,
+            "slices": slices,
+            "possible_truncation": possible_truncation,
+            "errors": errors,
+        }
 
     def collect(self, tables: Sequence[str], start: datetime, end: datetime) -> Dict[str, Any]:
         collected: Dict[str, Any] = {}
-        for position, table in enumerate(tables, start=1):
-            logging.info(
-                "Collecting Defender Advanced Hunting table %d/%d: %s",
-                position,
-                len(tables),
-                table,
-            )
+        for table in tables:
+            logging.info("Collecting Defender Advanced Hunting table: %s", table)
             collected[table] = self.collect_table(table, start, end)
         return collected
+
 
 def build_correlated_email_index(hunting: Mapping[str, Any]) -> List[Dict[str, Any]]:
     """Correlate email metadata from hunting tables by NetworkMessageId."""
@@ -803,153 +679,6 @@ def build_correlated_email_index(hunting: Mapping[str, Any]) -> List[Dict[str, A
             item[summary_field] = list(dict.fromkeys(values))
 
     return sorted(index.values(), key=lambda item: item["networkMessageId"])
-
-
-class PurviewAuditSearchCollector:
-    """Collect the unified Microsoft Purview audit log through Microsoft Graph.
-
-    This is separate from the near-real-time Office 365 Management Activity feed.
-    It creates asynchronous audit searches, waits for completion, and downloads all
-    paged records that the caller's AuditLogsQuery permissions and retention allow.
-    """
-
-    def __init__(
-        self,
-        client: ApiClient,
-        *,
-        chunk_days: int = 7,
-        poll_seconds: int = 5,
-        timeout_seconds: int = 900,
-    ) -> None:
-        if chunk_days <= 0 or chunk_days > 180:
-            raise CollectorError("--purview-audit-chunk-days must be between 1 and 180")
-        if poll_seconds <= 0:
-            raise CollectorError("--purview-audit-poll-seconds must be greater than zero")
-        if timeout_seconds <= 0:
-            raise CollectorError("--purview-audit-timeout-seconds must be greater than zero")
-        self.client = client
-        self.chunk_size = timedelta(days=chunk_days)
-        self.poll_seconds = poll_seconds
-        self.timeout_seconds = timeout_seconds
-        self.root = f"{GRAPH_BASE}/security/auditLog/queries"
-
-    def create_query(self, start: datetime, end: datetime) -> Dict[str, Any]:
-        display_name = (
-            "m365-security-exporter-"
-            f"{start.strftime('%Y%m%dT%H%M%SZ')}-"
-            f"{end.strftime('%Y%m%dT%H%M%SZ')}"
-        )
-        payload, _ = self.client.post_json(
-            self.root,
-            json_body={
-                "@odata.type": "#microsoft.graph.security.auditLogQuery",
-                "displayName": display_name,
-                "filterStartDateTime": iso_z(start),
-                "filterEndDateTime": iso_z(end),
-            },
-            expected=(201,),
-        )
-        if not isinstance(payload, dict) or not payload.get("id"):
-            raise CollectorError("Purview Audit Search API didn't return a query ID")
-        return payload
-
-    def get_query(self, query_id: str) -> Dict[str, Any]:
-        payload, _ = self.client.get_json(f"{self.root}/{query_id}")
-        if not isinstance(payload, dict):
-            raise CollectorError(f"Unexpected Purview audit query response for {query_id}")
-        return payload
-
-    def wait_for_query(self, query_id: str) -> Dict[str, Any]:
-        deadline = time.monotonic() + self.timeout_seconds
-        last_status = "unknown"
-        while time.monotonic() < deadline:
-            query = self.get_query(query_id)
-            last_status = str(query.get("status", "unknown")).casefold()
-            if last_status == "succeeded":
-                return query
-            if last_status in {"failed", "cancelled"}:
-                raise CollectorError(
-                    f"Purview audit query {query_id} finished with status {last_status}: {query}"
-                )
-            time.sleep(self.poll_seconds)
-        raise CollectorError(
-            f"Timed out after {self.timeout_seconds}s waiting for Purview audit query "
-            f"{query_id}; last status was {last_status}"
-        )
-
-    def list_records(self, query_id: str) -> List[Dict[str, Any]]:
-        url = f"{self.root}/{query_id}/records"
-        params: Optional[Mapping[str, Any]] = {"$top": "1000"}
-        records: List[Dict[str, Any]] = []
-        while url:
-            payload, _ = self.client.get_json(url, params=params)
-            params = None
-            if not isinstance(payload, dict):
-                raise CollectorError(f"Unexpected audit record response for query {query_id}")
-            values = payload.get("value", [])
-            if not isinstance(values, list):
-                raise CollectorError(f"Unexpected audit record collection for query {query_id}")
-            records.extend(item for item in values if isinstance(item, dict))
-            url = str(payload.get("@odata.nextLink") or "")
-        return records
-
-    def collect_window(self, start: datetime, end: datetime) -> Dict[str, Any]:
-        created = self.create_query(start, end)
-        query_id = str(created["id"])
-        completed = self.wait_for_query(query_id)
-        records = self.list_records(query_id)
-        deduplicated = unique_records(records)
-        return {
-            "window": {"start": iso_z(start), "end": iso_z(end)},
-            "query": completed,
-            "records": deduplicated,
-            "counts": {
-                "records_before_deduplication": len(records),
-                "records": len(deduplicated),
-            },
-        }
-
-    def collect(self, start: datetime, end: datetime) -> Dict[str, Any]:
-        windows: List[Dict[str, Any]] = []
-        all_records: List[Dict[str, Any]] = []
-        errors: List[Dict[str, Any]] = []
-        for window_start, window_end in chunks(start, end, self.chunk_size):
-            logging.info(
-                "Collecting Purview Audit Search records: %s to %s",
-                iso_z(window_start),
-                iso_z(window_end),
-            )
-            try:
-                result = self.collect_window(window_start, window_end)
-                windows.append(
-                    {
-                        "window": result["window"],
-                        "query": result["query"],
-                        "counts": result["counts"],
-                    }
-                )
-                all_records.extend(result["records"])
-            except Exception as exc:
-                logging.exception("Purview Audit Search failed")
-                errors.append(
-                    {
-                        "start": iso_z(window_start),
-                        "end": iso_z(window_end),
-                        "error": str(exc),
-                    }
-                )
-
-        deduplicated = unique_records(all_records)
-        return {
-            "windows": windows,
-            "records": deduplicated,
-            "counts": {
-                "windows": len(windows),
-                "records_before_deduplication": len(all_records),
-                "records": len(deduplicated),
-            },
-            "errors": errors,
-        }
 
 
 class PurviewActivityCollector:
@@ -1155,7 +884,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--hunting-table",
         action="append",
         dest="hunting_tables",
-        help="Advanced Hunting table to export. Repeatable. Defaults to every documented XDR table.",
+        help="Advanced Hunting table to export. Repeatable. Defaults to alert/email tables.",
     )
     parser.add_argument(
         "--purview-content-type",
@@ -1167,64 +896,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--hunting-chunk-hours",
         type=int,
         default=6,
-        help="Initial Advanced Hunting time chunk size. Default: 6 hours.",
-    )
-    parser.add_argument(
-        "--hunting-min-chunk-minutes",
-        type=int,
-        default=5,
-        help="Smallest recursive time slice when a hunting query hits the row ceiling. Default: 5.",
-    )
-    parser.add_argument(
-        "--hunting-max-rows",
-        type=int,
-        default=ADVANCED_HUNTING_MAX_ROWS,
-        help=f"Maximum rows requested per hunting query. Max/default: {ADVANCED_HUNTING_MAX_ROWS}.",
-    )
-    parser.add_argument(
-        "--hunting-api",
-        choices=("auto", "graph", "legacy"),
-        default="auto",
-        help=(
-            "Advanced Hunting API. auto prefers Microsoft Graph and falls back to the legacy "
-            "Defender endpoint. Default: auto."
-        ),
+        help="Advanced Hunting query chunk size. Default: 6 hours.",
     )
     parser.add_argument("--skip-graph-security", action="store_true", help="Skip Graph incidents/alerts.")
     parser.add_argument("--skip-hunting", action="store_true", help="Skip Defender Advanced Hunting.")
-    parser.add_argument(
-        "--skip-purview",
-        action="store_true",
-        help="Skip both Purview Audit Search and the Management Activity feed.",
-    )
-    parser.add_argument(
-        "--skip-purview-audit-search",
-        action="store_true",
-        help="Skip the Microsoft Graph Purview Audit Search API.",
-    )
-    parser.add_argument(
-        "--skip-purview-activity-feed",
-        action="store_true",
-        help="Skip the Office 365 Management Activity API feed.",
-    )
-    parser.add_argument(
-        "--purview-audit-chunk-days",
-        type=int,
-        default=7,
-        help="Purview Audit Search query window size, 1-180 days. Default: 7.",
-    )
-    parser.add_argument(
-        "--purview-audit-poll-seconds",
-        type=int,
-        default=5,
-        help="Seconds between Purview Audit Search status checks. Default: 5.",
-    )
-    parser.add_argument(
-        "--purview-audit-timeout-seconds",
-        type=int,
-        default=900,
-        help="Maximum wait per Purview Audit Search query. Default: 900.",
-    )
+    parser.add_argument("--skip-purview", action="store_true", help="Skip Purview activity feed.")
     parser.add_argument(
         "--start-subscription",
         action="append",
@@ -1291,12 +967,9 @@ def main() -> int:
         "errors": [],
         "notes": [
             "Raw fields returned by Microsoft APIs are preserved.",
-            "All currently documented Microsoft Defender XDR Advanced Hunting tables are requested by default, including preview and Purview-backed tables.",
-            "Defender Advanced Hunting normally retains up to 30 days of raw data and caps each API query at 100,000 rows and a result-size limit.",
-            "Snapshot/entity hunting tables without Timestamp are exported with a single capped query and are marked possible_truncation when the row ceiling is reached.",
-            "Purview Audit Search retrieves unified audit records allowed by tenant retention and AuditLogsQuery permissions.",
-            "The Purview Management Activity API exposes exactly five content types and can list content made available during only the last 7 days.",
-            "Purview Data Explorer and Content Explorer do not expose a universal bulk-export API; DataSecurityEvents, DataSecurityBehaviors, unified audit records, and DLP activity are the supported programmatic paths used here.",
+            "Defender Advanced Hunting normally retains up to 30 days of raw data.",
+            "The Purview Management Activity API can list content made available during only the last 7 days.",
+            "Purview Data Explorer and Content Explorer do not expose a universal bulk-export API; this export uses the unified audit/DLP activity feed that powers many Activity Explorer scenarios.",
         ],
     }
 
@@ -1306,65 +979,37 @@ def main() -> int:
         except Exception as exc:
             add_error(result, "xdr.graph_security", exc)
 
-    hunting_tables = tuple(dict.fromkeys(args.hunting_tables or DEFAULT_HUNTING_TABLES))
+    hunting_tables = tuple(args.hunting_tables or DEFAULT_HUNTING_TABLES)
     if not args.skip_hunting:
         try:
-            hunting_collector = AdvancedHuntingCollector(
-                graph_client,
-                defender_client,
-                args.hunting_chunk_hours,
-                min_chunk_minutes=args.hunting_min_chunk_minutes,
-                max_rows=args.hunting_max_rows,
-                backend=args.hunting_api,
+            hunting = AdvancedHuntingCollector(defender_client, args.hunting_chunk_hours).collect(
+                hunting_tables, start, end
             )
-            hunting = hunting_collector.collect(hunting_tables, start, end)
             result["xdr"]["advanced_hunting"] = hunting
-            result["xdr"]["advanced_hunting_metadata"] = {
-                "requestedTables": list(hunting_tables),
-                "requestedTableCount": len(hunting_tables),
-                "selectedApi": hunting_collector.selected_backend,
-                "graphFallbackReason": hunting_collector.backend_probe_error,
-            }
             result["xdr"]["correlated_emails"] = build_correlated_email_index(hunting)
             result["xdr"]["correlated_email_count"] = len(result["xdr"]["correlated_emails"])
         except Exception as exc:
             add_error(result, "xdr.advanced_hunting", exc)
 
-    purview_content_types = tuple(
-        dict.fromkeys(args.purview_content_types or DEFAULT_PURVIEW_CONTENT_TYPES)
-    )
+    purview_content_types = tuple(args.purview_content_types or DEFAULT_PURVIEW_CONTENT_TYPES)
     if not args.skip_purview:
+        purview_start = max(start, end - timedelta(days=7))
         result["purview"]["requestedWindow"] = {"start": iso_z(start), "end": iso_z(end)}
-
-        if not args.skip_purview_audit_search:
-            try:
-                audit_search_collector = PurviewAuditSearchCollector(
-                    graph_client,
-                    chunk_days=args.purview_audit_chunk_days,
-                    poll_seconds=args.purview_audit_poll_seconds,
-                    timeout_seconds=args.purview_audit_timeout_seconds,
-                )
-                result["purview"]["audit_search"] = audit_search_collector.collect(start, end)
-            except Exception as exc:
-                add_error(result, "purview.audit_search", exc)
-
-        if not args.skip_purview_activity_feed:
-            purview_start = max(start, end - timedelta(days=7))
-            result["purview"]["effectiveActivityFeedWindow"] = {
-                "start": iso_z(purview_start),
-                "end": iso_z(end),
-            }
-            if purview_start > start:
-                result["purview"]["activityFeedWindowWarning"] = (
-                    "Purview activity feed retrieval was capped to seven days because older content "
-                    "blobs cannot be listed or downloaded through this API."
-                )
-            try:
-                result["purview"]["activity_feed"] = purview_collector.collect(
-                    purview_content_types, purview_start, end
-                )
-            except Exception as exc:
-                add_error(result, "purview.activity_feed", exc)
+        result["purview"]["effectiveActivityFeedWindow"] = {
+            "start": iso_z(purview_start),
+            "end": iso_z(end),
+        }
+        if purview_start > start:
+            result["purview"]["windowWarning"] = (
+                "Purview activity feed retrieval was capped to seven days because older content blobs "
+                "cannot be listed or downloaded through this API."
+            )
+        try:
+            result["purview"]["activity_feed"] = purview_collector.collect(
+                purview_content_types, purview_start, end
+            )
+        except Exception as exc:
+            add_error(result, "purview.activity_feed", exc)
 
     output_path = Path(args.output).expanduser().resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)
