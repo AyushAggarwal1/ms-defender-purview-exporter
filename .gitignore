@@ -216,3 +216,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# poller.py runtime state (continuous polling service)
+/output/
+/state/
+
+/outputs
