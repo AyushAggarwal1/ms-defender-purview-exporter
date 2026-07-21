@@ -96,6 +96,38 @@ python collector.py --start-subscription DLP.All
 
 New subscriptions may not return data immediately.
 
+## Real-time streaming (realtime_collector.py)
+
+`collector.py` exports one fixed time window to a single JSON file. `realtime_collector.py`
+reuses the same authentication and collection logic but polls continuously on an interval,
+tracking a per-source checkpoint so each cycle only fetches data newer than the last
+successful poll. New records are appended to per-stream `.jsonl` files under `--output-dir`,
+which downstream tooling (Filebeat, a SIEM forwarder, `tail -f`, etc.) can consume as they land.
+
+```bash
+python realtime_collector.py --output-dir realtime-export --poll-interval 300
+```
+
+Useful options:
+
+```bash
+--lag-seconds 180              # trail "now" by this much to absorb backend ingestion delay
+--initial-lookback-minutes 60  # how far back to reach on first run for a source with no checkpoint
+--hunting-table EmailEvents    # repeatable, same semantics as collector.py
+--purview-content-type DLP.All # repeatable, same semantics as collector.py
+--skip-graph-security / --skip-hunting / --skip-purview
+--once                         # run a single poll cycle and exit (useful for testing/cron)
+```
+
+Checkpoints and the Advanced Hunting table-schema cache persist to `<output-dir>/state.json`
+(or `--state-file`), so stopping and restarting the process does not create gaps or re-fetch
+already-collected data. Advanced Hunting's correlated email index is rebuilt each cycle from
+that cycle's rows only — an email whose parts (attachment, URL click, post-delivery action)
+land in a different poll cycle than the original message is not merged into one record.
+
+Send `SIGINT`/`SIGTERM` (e.g. Ctrl-C) to stop; the current cycle finishes and state is saved
+before exit.
+
 ## Export all configured sources
 
 ```bash
